@@ -34,7 +34,9 @@ import com.google.common.io.ByteStreams;
 import com.google.common.io.CountingOutputStream;
 import com.google.common.io.MoreFiles;
 import com.google.common.io.RecursiveDeleteOption;
+import java.awt.image.BufferedImage;
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.CharArrayWriter;
 import java.io.Closeable;
 import java.io.File;
@@ -45,6 +47,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.io.UncheckedIOException;
 import java.io.Writer;
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -71,6 +74,7 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarInputStream;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import javax.annotation.Nullable;
@@ -79,9 +83,14 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.SneakyThrows;
 import lombok.Value;
+import net.runelite.pluginhub.apirecorder.API;
+import net.runelite.pluginhub.apirecorder.ClassRecorder;
 import net.runelite.pluginhub.uploader.ExternalPluginManifest;
 import net.runelite.pluginhub.uploader.UploadConfiguration;
+import net.runelite.pluginhub.uploader.Util;
 import okhttp3.HttpUrl;
+import okhttp3.Request;
+import okhttp3.Response;
 import org.gradle.tooling.CancellationTokenSource;
 import org.gradle.tooling.GradleConnectionException;
 import org.gradle.tooling.GradleConnector;
@@ -104,8 +113,16 @@ public class Plugin implements Closeable
 	private static final Pattern REPOSITORY_TEST = Pattern.compile("^(https://github\\.com/.*)\\.git$");
 	private static final Pattern COMMIT_TEST = Pattern.compile("^[a-fA-F0-9]{40}$");
 
+	private static final String SUFFIX_JAR = ".jar";
+	private static final String SUFFIX_SOURCES = "-sources.zip";
+	private static final String SUFFIX_API = ".api";
+	private static final String SUFFIX_ICON = ".png";
+
 	private static final File TMP_ROOT;
 	private static final File GRADLE_HOME;
+
+	static final API CURRENT_API;
+	private static final Map<String, String> DISALLOWED_APIS;
 
 	static
 	{
@@ -120,6 +137,12 @@ public class Plugin implements Closeable
 			if (!GRADLE_HOME.exists())
 			{
 				throw new RuntimeException("gradle home has moved");
+			}
+
+			CURRENT_API = calculateAPI();
+			try (InputStream is = Packager.class.getResourceAsStream("disallowed-apis.txt"))
+			{
+				DISALLOWED_APIS = CURRENT_API.parseCommented(is, false);
 			}
 		}
 		catch (IOException e)
@@ -141,6 +164,9 @@ public class Plugin implements Closeable
 	private final File jarFile;
 	private final File srcZipFile;
 	private final File iconFile;
+
+	@Getter
+	private final File apiFile;
 
 	@Getter
 	private final File logFile;
@@ -223,6 +249,7 @@ public class Plugin implements Closeable
 		defaultSupportURL = repoRoot + "/tree/" + commit;
 
 		warning = (String) cd.remove("warning");
+		cd.remove("authors");
 
 		for (Map.Entry<Object, Object> extra : cd.entrySet())
 		{
@@ -239,8 +266,28 @@ public class Plugin implements Closeable
 		logFile = new File(buildDirectory, "log");
 		log = new FileOutputStream(logFile, true);
 		jarFile = new File(buildDirectory, "plugin.jar");
+		apiFile = new File(buildDirectory, "api");
 		srcZipFile = new File(buildDirectory, "source.zip");
 		iconFile = new File(repositoryDirectory, "icon.png");
+	}
+
+	@SneakyThrows
+	private static API calculateAPI() throws IOException
+	{
+		Process gradleApi = new ProcessBuilder(new File(Packager.PACKAGE_ROOT, "gradlew").getAbsolutePath(), "--console=plain", ":apirecorder:api")
+			.directory(Packager.PACKAGE_ROOT)
+			.inheritIO()
+			.start();
+		gradleApi.waitFor(2, TimeUnit.MINUTES);
+		if (gradleApi.exitValue() != 0)
+		{
+			throw new RuntimeException("gradle :apirecorder:api exited with " + gradleApi.exitValue());
+		}
+
+		try (InputStream is = new FileInputStream(new File(Packager.PACKAGE_ROOT, "apirecorder/build/api")))
+		{
+			return API.decode(is);
+		}
 	}
 
 	private void waitAndCheck(Process process, String name, long timeout, TimeUnit timeoutUnit) throws PluginBuildException
@@ -261,6 +308,60 @@ public class Plugin implements Closeable
 		if (process.exitValue() != 0)
 		{
 			throw PluginBuildException.of(this, name + " exited with " + process.exitValue());
+		}
+	}
+
+	public boolean rebuildNeeded(UploadConfiguration uploadConfig, String previousVersion) throws IOException
+	{
+		if (previousVersion == null)
+		{
+			return true;
+		}
+
+		HttpUrl oldPluginRoot = uploadConfig.getVersionlessRoot().newBuilder()
+			.addPathSegment(previousVersion)
+			.addPathSegment(internalName)
+			.build();
+
+		try (Response res = uploadConfig.getClient().newCall(new Request.Builder()
+			.url(oldPluginRoot.newBuilder()
+				.addPathSegment(commit + SUFFIX_API)
+				.build())
+			.get()
+			.build()).execute())
+		{
+			if (res.code() == 404)
+			{
+				return true;
+			}
+			Util.check(res);
+
+			String missing = API.decode(res.body().byteStream())
+				.missingFrom(CURRENT_API)
+				.collect(Collectors.joining("\n"));
+
+			if (!missing.isEmpty())
+			{
+				writeLog("API changed; rebuild needed. changed:\n{}\n", missing);
+				return true;
+			}
+
+			HttpUrl pluginRoot = uploadConfig.getUploadRepoRoot().newBuilder()
+				.addPathSegment(internalName)
+				.build();
+
+			uploadConfig.mkdirs(pluginRoot);
+			uploadConfig.copy(oldPluginRoot, pluginRoot, commit + SUFFIX_JAR, true);
+			uploadConfig.copy(oldPluginRoot, pluginRoot, commit + SUFFIX_API, true);
+			uploadConfig.copy(oldPluginRoot, pluginRoot, commit + SUFFIX_SOURCES, true);
+			uploadConfig.copy(oldPluginRoot, pluginRoot, commit + SUFFIX_ICON, false);
+
+			return false;
+		}
+		catch (UncheckedIOException | IOException e)
+		{
+			writeLog("failed to check api compatibility\n", e);
+			return true;
 		}
 	}
 
@@ -398,7 +499,7 @@ public class Plugin implements Closeable
 					"--console=plain",
 					"--init-script", new File("./package/target_init.gradle").getAbsolutePath())
 				.setEnvironmentVariables(ImmutableMap.of(
-					"runelite.pluginhub.package.lib", new File(Packager.PACKAGE_ROOT, "initLib/build/libs/initLib.jar").toString(),
+					"runelite.pluginhub.package.apirecorder", new File(Packager.PACKAGE_ROOT, "apirecorder/build/libs/apirecorder.jar").toString(),
 					"runelite.pluginhub.package.buildDir", buildDirectory.getAbsolutePath(),
 					"runelite.pluginhub.package.runeliteVersion", runeliteVersion))
 				.setJvmArguments("-Xmx768M", "-XX:+UseParallelGC")
@@ -406,7 +507,7 @@ public class Plugin implements Closeable
 				.setStandardError(log)
 				.forTasks("runelitePluginHubPackage", "runelitePluginHubManifest")
 				.withCancellationToken(cancel.token())
-				.run(new ResultHandler<Void>()
+				.run(new ResultHandler<>()
 				{
 					@Override
 					public void onComplete(Void result)
@@ -444,7 +545,7 @@ public class Plugin implements Closeable
 		}
 	}
 
-	public void assembleManifest() throws IOException, PluginBuildException
+	public void assembleManifest(boolean disallowedFatal) throws IOException, PluginBuildException
 	{
 		manifest.setInternalName(internalName);
 		manifest.setCommit(commit);
@@ -501,11 +602,12 @@ public class Plugin implements Closeable
 					.withFile(iconFile);
 			}
 
+			BufferedImage bimg;
 			synchronized (ImageIO.class)
 			{
 				try
 				{
-					Objects.requireNonNull(ImageIO.read(iconFile));
+					bimg = Objects.requireNonNull(ImageIO.read(iconFile));
 				}
 				catch (Exception e)
 				{
@@ -514,12 +616,29 @@ public class Plugin implements Closeable
 				}
 			}
 
-			manifest.setHasIcon(true);
+			if (bimg.getWidth() * bimg.getHeight() > 50 * 100)
+			{
+				if (disallowedFatal)
+				{
+					throw PluginBuildException.of(this, "icon.png is too high-resolution. It should be 48x72 px")
+						.withFile(iconFile);
+				}
+				else
+				{
+					writeLog("icon.png is too high-resolution. It should be 48x72 px\n");
+				}
+			}
+			else
+			{
+				manifest.setHasIcon(true);
+			}
 		}
 
 		Set<String> pluginClasses = new HashSet<>();
 		Set<String> jarClasses = new HashSet<>();
 		{
+			ClassRecorder builtinApi = new ClassRecorder();
+
 			try (JarInputStream jis = new JarInputStream(new FileInputStream(jarFile)))
 			{
 				for (JarEntry je; (je = jis.getNextJarEntry()) != null; )
@@ -530,42 +649,83 @@ public class Plugin implements Closeable
 						continue;
 					}
 
+					boolean isMultiRelease = fileName.startsWith("META-INF/versions");
 					byte[] classData = ByteStreams.toByteArray(jis);
-					new ClassReader(classData).accept(new ClassVisitor(Opcodes.ASM7)
+
+					try
 					{
-						boolean extendsPlugin;
-						String name;
-
-						@SneakyThrows
-						@Override
-						public void visit(int version, int access, String name, String signature, String superName, String[] interfaces)
+						new ClassReader(classData).accept(new ClassVisitor(Opcodes.ASM7, builtinApi)
 						{
-							if ((version & 0xFFFF) > Opcodes.V1_8
-								&& !(fileName.startsWith("META-INF/versions") || fileName.endsWith("module-info.class")))
+							boolean extendsPlugin;
+							String name;
+
+							@SneakyThrows
+							@Override
+							public void visit(int version, int access, String name, String signature, String superName, String[] interfaces)
 							{
-								throw PluginBuildException.of(Plugin.this, "plugins must be Java 1.8 compatible")
-									.withFile(fileName);
+								if ((version & 0xFFFF) > Opcodes.V1_8
+									&& !(isMultiRelease || fileName.endsWith("module-info.class")))
+								{
+									throw PluginBuildException.of(Plugin.this, "plugins must be Java 1.8 compatible")
+										.withFile(fileName);
+								}
+
+								jarClasses.add(name.replace('/', '.'));
+
+								extendsPlugin = "net/runelite/client/plugins/Plugin".equals(superName);
+								this.name = name;
+								super.visit(version, access, name, signature, superName, interfaces);
 							}
 
-							jarClasses.add(name.replace('/', '.'));
-
-							extendsPlugin = "net/runelite/client/plugins/Plugin".equals(superName);
-							this.name = name;
-							super.visit(version, access, name, signature, superName, interfaces);
-						}
-
-						@Override
-						public AnnotationVisitor visitAnnotation(String descriptor, boolean visible)
-						{
-							if ("Lnet/runelite/client/plugins/PluginDescriptor;".equals(descriptor) && extendsPlugin)
+							@Override
+							public AnnotationVisitor visitAnnotation(String descriptor, boolean visible)
 							{
-								pluginClasses.add(name.replace('/', '.'));
-							}
+								if ("Lnet/runelite/client/plugins/PluginDescriptor;".equals(descriptor) && extendsPlugin)
+								{
+									pluginClasses.add(name.replace('/', '.'));
+								}
 
-							return null;
+								return null;
+							}
+						}, ClassReader.SKIP_CODE);
+					}
+					catch (IllegalArgumentException e)
+					{
+						if (isMultiRelease)
+						{
+							// allow multirelease classes to not be parsable by asm, they may be too new
+							continue;
 						}
-					}, ClassReader.SKIP_FRAMES);
+
+						throw e;
+					}
 				}
+			}
+
+			if (apiFile.exists())
+			{
+				// we can record api symbols from the plugin's own dependencies, we need to strip those
+				ByteArrayOutputStream out = new ByteArrayOutputStream();
+				try (FileInputStream fis = new FileInputStream(apiFile))
+				{
+					API api = API.decode(fis);
+					API.encode(out, api.missingFrom(builtinApi.getApi()));
+					String disallowed = api.disallowed(DISALLOWED_APIS)
+						.stream()
+						.collect(Collectors.joining("\n"));
+					if (!disallowed.isEmpty())
+					{
+						if (disallowedFatal)
+						{
+							throw PluginBuildException.of(this, "plugin uses terminally deprecated APIs:\n{}", disallowed);
+						}
+						else
+						{
+							writeLog("plugin uses terminally deprecated APIs:\n{}\n", disallowed);
+						}
+					}
+				}
+				Files.write(apiFile.toPath(), out.toByteArray());
 			}
 		}
 
@@ -677,7 +837,7 @@ public class Plugin implements Closeable
 					unusedPlugins.removeAll(plugins);
 
 					throw PluginBuildException.of(this,
-						"Plugin class \"{}\" is missing from the output jar", className)
+							"Plugin class \"{}\" is missing from the output jar", className)
 						.withHelp(unusedPlugins.isEmpty()
 							? "All plugins must extend Plugin an have an @PluginDescriptor"
 							: ("Perhaps you wanted " + String.join(", ", unusedPlugins)))
@@ -741,17 +901,24 @@ public class Plugin implements Closeable
 			.build();
 
 		uploadConfig.put(
-			pluginRoot.newBuilder().addPathSegment(commit + ".jar").build(),
+			pluginRoot.newBuilder().addPathSegment(commit + SUFFIX_JAR).build(),
 			jarFile);
 
+		if (apiFile.exists())
+		{
+			uploadConfig.put(
+				pluginRoot.newBuilder().addPathSegment(commit + SUFFIX_API).build(),
+				apiFile);
+		}
+
 		uploadConfig.put(
-			pluginRoot.newBuilder().addPathSegment(commit + "-sources.zip").build(),
+			pluginRoot.newBuilder().addPathSegment(commit + SUFFIX_SOURCES).build(),
 			srcZipFile);
 
 		if (manifest.isHasIcon())
 		{
 			uploadConfig.put(
-				pluginRoot.newBuilder().addPathSegment(commit + ".png").build(),
+				pluginRoot.newBuilder().addPathSegment(commit + SUFFIX_ICON).build(),
 				iconFile);
 		}
 	}
@@ -775,6 +942,12 @@ public class Plugin implements Closeable
 		uploadConfig.put(url, logFile);
 
 		return url.toString();
+	}
+
+	public void copyArtifacts(File artifactDir) throws IOException
+	{
+		Files.copy(jarFile.toPath(), new File(artifactDir, getInternalName() + ".jar").toPath());
+		Files.copy(logFile.toPath(), new File(artifactDir, getInternalName() + ".log").toPath());
 	}
 
 	public void writeLog(String format, Object... args) throws IOException
